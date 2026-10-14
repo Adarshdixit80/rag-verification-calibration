@@ -11,3 +11,4 @@ rank_bm25
 sentence-transformers
 google-generativeai
 sentencepiece
+accelerate

@@ -241,6 +241,7 @@ def setup_training(
     epochs: int = 3,
     learning_rate: float = 2e-5,
     weight_decay: float = 0.01,
+    warmup_steps: int = 100,
     val_split: float = 0.2,
     seed: int = 42,
     max_length: int = 512,
@@ -257,6 +258,7 @@ def setup_training(
         epochs: Number of complete training epochs.
         learning_rate: Initial peak learning rate for AdamW optimizer.
         weight_decay: L2 regularization penalty.
+        warmup_steps: Number of linear learning rate warmup steps.
         val_split: Proportion of data allocated for validation (default 0.20 = 80/20 split).
         seed: Random seed for deterministic shuffling and reproducibility.
         max_length: Maximum sequence truncation length.
@@ -311,7 +313,7 @@ def setup_training(
         per_device_eval_batch_size=batch_size,
         num_train_epochs=epochs,
         weight_decay=weight_decay,
-        warmup_ratio=0.1,
+        warmup_steps=warmup_steps,
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         greater_is_better=True,
