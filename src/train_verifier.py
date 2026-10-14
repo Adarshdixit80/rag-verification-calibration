@@ -289,6 +289,8 @@ def setup_training(
 
     # 2. Model & Tokenizer Initialization
     model, tokenizer = load_verifier_model_and_tokenizer(model_name=model_name)
+    # Explicitly move model to GPU if CUDA is available before creating Trainer
+    model = model.to('cuda') if torch.cuda.is_available() else model
 
     # 3. Tokenize Datasets
     train_dataset = prepare_data(train_df, tokenizer, max_length=max_length)
@@ -301,6 +303,7 @@ def setup_training(
     eval_param_key = "eval_strategy" if "eval_strategy" in valid_params else "evaluation_strategy"
 
     # Only include well-established, universally compatible parameters
+    # Note: explicitly ensuring no CPU-forcing parameters (like no_cuda=True or use_cpu=True)
     training_kwargs: Dict[str, Any] = {
         "output_dir": str(output_path),
         "num_train_epochs": epochs,
@@ -316,6 +319,10 @@ def setup_training(
         "metric_for_best_model": "f1",
         "seed": seed,
     }
+
+    # Ensure no parameters force CPU usage
+    for cpu_flag in ("no_cuda", "use_cpu"):
+        training_kwargs.pop(cpu_flag, None)
 
     try:
         training_args = TrainingArguments(**training_kwargs)
@@ -345,6 +352,7 @@ def setup_training(
     )
 
     logger.info("Trainer successfully configured and initialized.")
+    print(f"Model is on device: {next(model.parameters()).device}")
     return trainer, model, tokenizer
 
 
