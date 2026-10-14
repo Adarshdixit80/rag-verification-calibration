@@ -15,11 +15,14 @@ This module implements:
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
+
+import transformers
 
 import numpy as np
 import pandas as pd
@@ -292,40 +295,45 @@ def setup_training(
     val_dataset = prepare_data(val_df, tokenizer, max_length=max_length)
 
     # 4. Training Arguments
-    # Try eval_strategy (transformers >= 4.41) with backwards-compatible evaluation_strategy fallback
-    eval_kwargs: Dict[str, Any] = {}
-    try:
-        # Check if TrainingArguments supports eval_strategy
-        import inspect
-        sig = inspect.signature(TrainingArguments.__init__)
-        if "eval_strategy" in sig.parameters:
-            eval_kwargs["eval_strategy"] = "epoch"
-        else:
-            eval_kwargs["evaluation_strategy"] = "epoch"
-    except Exception:  # pylint: disable=broad-except
-        eval_kwargs["eval_strategy"] = "epoch"
+    # Dynamically select 'eval_strategy' (transformers >= 4.41) or 'evaluation_strategy' (< 4.41)
+    sig = inspect.signature(TrainingArguments.__init__)
+    valid_params = set(sig.parameters.keys())
+    eval_param_key = "eval_strategy" if "eval_strategy" in valid_params else "evaluation_strategy"
 
-    training_args = TrainingArguments(
-        output_dir=str(output_path),
-        save_strategy="epoch",
-        learning_rate=learning_rate,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        num_train_epochs=epochs,
-        weight_decay=weight_decay,
-        warmup_steps=warmup_steps,
-        load_best_model_at_end=True,
-        metric_for_best_model="f1",
-        greater_is_better=True,
-        seed=seed,
-        data_seed=seed,
-        logging_dir=DEFAULT_LOGS_DIR,
-        logging_steps=logging_steps,
-        save_total_limit=2,
-        report_to="none",  # Avoid external tracking prompts during automated runs
-        fp16=torch.cuda.is_available(),
-        **eval_kwargs,
-    )
+    # Only include well-established, universally compatible parameters
+    training_kwargs: Dict[str, Any] = {
+        "output_dir": str(output_path),
+        "num_train_epochs": epochs,
+        "per_device_train_batch_size": batch_size,
+        "per_device_eval_batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "warmup_steps": warmup_steps,
+        eval_param_key: "epoch",
+        "save_strategy": "epoch",
+        "logging_steps": logging_steps,
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "f1",
+        "seed": seed,
+    }
+
+    try:
+        training_args = TrainingArguments(**training_kwargs)
+    except Exception as exc:  # Catch TypeError or version incompatibilities and report exact signature
+        valid_keys = sorted(list(sig.parameters.keys()))
+        version_str = getattr(transformers, "__version__", "unknown")
+        print(f"\n[ERROR] TrainingArguments initialization failed: {exc}")
+        print(f"[DEBUG] Installed transformers version: {version_str}")
+        print(f"[DEBUG] Valid parameters accepted by TrainingArguments ({len(valid_keys)} total):")
+        for param_name in valid_keys:
+            print(f"  - {param_name}")
+        logger.error(
+            "TrainingArguments initialization failed: %s. Transformers version: %s. Valid parameters: %s",
+            exc,
+            version_str,
+            valid_keys,
+        )
+        raise exc
 
     # 5. Trainer Construction
     trainer = Trainer(
