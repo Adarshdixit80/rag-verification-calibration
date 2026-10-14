@@ -1,0 +1,12 @@
+torch
+transformers
+datasets<4.0.0
+scikit-learn
+pandas
+numpy
+matplotlib
+seaborn
+netcal
+rank_bm25
+sentence-transformers
+google-generativeai

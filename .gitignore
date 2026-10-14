@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter / Colab
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Data files
+*.csv
+*.tsv
+*.json
+*.jsonl
+*.parquet
+*.arrow
+data/*
+!data/.gitkeep
+
+# Model checkpoints and weights
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.onnx
+checkpoints/
+models/
+
+# Raw experiment logs (preserve directory structure via .gitkeep)
+results/raw_logs/*
+!results/raw_logs/.gitkeep
+
+# Operating system & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Environment variables & secrets
+.env
