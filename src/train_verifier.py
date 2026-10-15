@@ -27,9 +27,11 @@ import transformers
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from datasets import Dataset
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
@@ -232,7 +234,56 @@ def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Training Pipeline Setup
+# 4. Custom Weighted Trainer (Handling Class Imbalance)
+# ---------------------------------------------------------------------------
+
+class WeightedTrainer(Trainer):
+    """Custom HuggingFace Trainer with class-weighted CrossEntropyLoss.
+
+    Mitigates majority-class collapse when fine-tuning on imbalanced verification
+    datasets (e.g. 72% SUPPORTED vs. 28% REFUTED) by scaling loss inversely proportional
+    to class frequencies: weight_i = total_samples / (num_classes * count_i).
+    """
+
+    def __init__(
+        self,
+        class_weights: Optional[torch.Tensor] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize WeightedTrainer with optional precomputed class weights tensor."""
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        return_outputs: bool = False,
+        num_items_in_batch: Optional[Union[torch.Tensor, int]] = None,
+        **kwargs: Any,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
+        """Compute class-weighted cross-entropy loss against ground-truth labels."""
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits") if isinstance(outputs, dict) else outputs.logits
+
+        if labels is not None and self.class_weights is not None:
+            # Move class weights tensor to the active model device and dtype
+            weights = self.class_weights.to(device=logits.device, dtype=logits.dtype)
+            loss_fct = nn.CrossEntropyLoss(weight=weights)
+            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        elif labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        else:
+            loss = outputs.get("loss") if isinstance(outputs, dict) else outputs.loss
+
+        return (loss, outputs) if return_outputs else loss
+
+
+# ---------------------------------------------------------------------------
+# 5. Training Pipeline Setup
 # ---------------------------------------------------------------------------
 
 def setup_training(
@@ -249,7 +300,7 @@ def setup_training(
     seed: int = 42,
     max_length: int = 512,
     logging_steps: int = 10,
-) -> Tuple[Trainer, PreTrainedModel, PreTrainedTokenizerBase]:
+) -> Tuple[WeightedTrainer, PreTrainedModel, PreTrainedTokenizerBase]:
     """Construct and configure the HuggingFace Trainer instance for verification fine-tuning.
 
     Args:
@@ -287,16 +338,38 @@ def setup_training(
     )
     logger.info("Split sizes: %d training samples, %d validation samples.", len(train_df), len(val_df))
 
-    # 2. Model & Tokenizer Initialization
+    # 2. Compute Class Weights for Imbalance Mitigation
+    train_labels = np.array(train_df["label"].tolist())
+    unique_classes = np.unique(train_labels)
+    if len(unique_classes) == 2:
+        class_weights_arr = compute_class_weight(
+            class_weight="balanced",
+            classes=np.array([0, 1]),
+            y=train_labels,
+        )
+    else:
+        class_weights_arr = np.ones(2, dtype=np.float32)
+
+    class_weights_tensor = torch.tensor(class_weights_arr, dtype=torch.float32)
+
+    # Verification print of computed class weights
+    print(
+        f"[WeightedTrainer] Computed Class Weights (balanced): "
+        f"Class 0 (REFUTED): {class_weights_arr[0]:.4f}, "
+        f"Class 1 (SUPPORTED): {class_weights_arr[1]:.4f}"
+    )
+    logger.info("Class weights tensor: %s", class_weights_tensor)
+
+    # 3. Model & Tokenizer Initialization
     model, tokenizer = load_verifier_model_and_tokenizer(model_name=model_name)
     # Explicitly move model to GPU if CUDA is available before creating Trainer
     model = model.to('cuda') if torch.cuda.is_available() else model
 
-    # 3. Tokenize Datasets
+    # 4. Tokenize Datasets
     train_dataset = prepare_data(train_df, tokenizer, max_length=max_length)
     val_dataset = prepare_data(val_df, tokenizer, max_length=max_length)
 
-    # 4. Training Arguments
+    # 5. Training Arguments
     # Dynamically select 'eval_strategy' (transformers >= 4.41) or 'evaluation_strategy' (< 4.41)
     sig = inspect.signature(TrainingArguments.__init__)
     valid_params = set(sig.parameters.keys())
@@ -354,16 +427,17 @@ def setup_training(
         )
         raise exc
 
-    # 5. Trainer Construction
-    trainer = Trainer(
+    # 6. Trainer Construction (WeightedTrainer)
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
+        class_weights=class_weights_tensor,
     )
 
-    logger.info("Trainer successfully configured and initialized.")
+    logger.info("WeightedTrainer successfully configured and initialized with class weights.")
     print(f"Model is on device: {next(model.parameters()).device}")
     return trainer, model, tokenizer
 
