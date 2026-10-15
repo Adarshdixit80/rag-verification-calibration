@@ -242,7 +242,7 @@ def setup_training(
     best_model_dir: Union[str, Path] = DEFAULT_CHECKPOINT_DIR,
     batch_size: int = 8,
     epochs: int = 3,
-    learning_rate: float = 2e-5,
+    learning_rate: float = 1e-5,
     weight_decay: float = 0.01,
     warmup_steps: int = 100,
     val_split: float = 0.2,
@@ -302,6 +302,15 @@ def setup_training(
     valid_params = set(sig.parameters.keys())
     eval_param_key = "eval_strategy" if "eval_strategy" in valid_params else "evaluation_strategy"
 
+    # Precision & Stability Configuration for DeBERTa-v3:
+    # DeBERTa-v3 is known to produce NaN gradients under fp16 mixed precision.
+    # Check if bf16 is supported on the GPU; if so, enable bf16, otherwise run in standard fp32.
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    if use_bf16:
+        logger.info("GPU supports bf16: using bf16=True for numerical stability (fp16=False).")
+    else:
+        logger.info("bf16 not supported or CUDA unavailable: running with fp16=False, bf16=False.")
+
     # Only include well-established, universally compatible parameters
     # Note: explicitly ensuring no CPU-forcing parameters (like no_cuda=True or use_cpu=True)
     training_kwargs: Dict[str, Any] = {
@@ -312,6 +321,9 @@ def setup_training(
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
         "warmup_steps": warmup_steps,
+        "max_grad_norm": 1.0,
+        "fp16": False,
+        "bf16": use_bf16,
         eval_param_key: "epoch",
         "save_strategy": "epoch",
         "logging_steps": logging_steps,
@@ -528,8 +540,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lr",
         type=float,
-        default=2e-5,
-        help="Learning rate (default: 2e-5)",
+        default=1e-5,
+        help="Learning rate (default: 1e-5)",
     )
     args, unknown = parser.parse_known_args()
 
