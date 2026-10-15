@@ -24,6 +24,11 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import transformers
 
+# Sanitize environment variables on Windows to prevent ValueError (>32767 chars)
+for _env_k in list(os.environ.keys()):
+    if len(os.environ[_env_k]) > 30000:
+        os.environ[_env_k] = os.environ[_env_k][:30000]
+
 import numpy as np
 import pandas as pd
 import torch
@@ -120,6 +125,7 @@ def prepare_data(
     df: pd.DataFrame,
     tokenizer: PreTrainedTokenizerBase,
     max_length: int = 512,
+    dataset_name: str = "",
 ) -> Dataset:
     """Preprocess and tokenize a DataFrame into a Hugging Face Dataset.
 
@@ -131,6 +137,7 @@ def prepare_data(
         df: Input DataFrame containing required verification columns.
         tokenizer: PreTrained Hugging Face tokenizer instance.
         max_length: Maximum sequence truncation length.
+        dataset_name: Optional name tag (e.g. 'Train', 'Validation') for logging clarity.
 
     Returns:
         Hugging Face Dataset with input_ids, attention_mask, and labels tensors.
@@ -174,7 +181,8 @@ def prepare_data(
 
     labels: list[int] = [int(lbl) for lbl in df["label"]]
 
-    logger.info("Tokenizing %d sequence pairs with max_length=%d...", len(df), max_length)
+    name_label = f" ({dataset_name})" if dataset_name else ""
+    logger.info("Tokenizing %d sequence pairs%s with max_length=%d...", len(df), name_label, max_length)
     tokenized = tokenizer(
         text=evidence_texts,
         text_pair=answer_texts,
@@ -194,7 +202,7 @@ def prepare_data(
         dataset_dict["token_type_ids"] = tokenized["token_type_ids"]
 
     hf_dataset = Dataset.from_dict(dataset_dict)
-    logger.info("Prepared Dataset with %d examples.", len(hf_dataset))
+    logger.info("Prepared%s Dataset with %d examples.", name_label, len(hf_dataset))
     return hf_dataset
 
 
@@ -208,8 +216,11 @@ def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
     Metrics calculated:
     - Accuracy: Overall classification correctness.
     - F1 Score (binary): Harmonic mean of precision and recall for positive (SUPPORTED) class.
+    - F1 Score (macro): Unweighted mean of F1 across both classes (REFUTED and SUPPORTED),
+      penalizing majority-class collapse.
     - Precision (binary): Ratio of true supported claims among all claims flagged as supported.
     - Recall (binary): Ratio of supported claims correctly verified.
+    - Pred Positive Ratio: Fraction of validation predictions predicted as Class 1.
 
     Args:
         eval_pred: EvalPrediction namedtuple containing (predictions, label_ids).
@@ -221,15 +232,19 @@ def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
     predictions = np.argmax(logits, axis=1)
 
     acc = accuracy_score(labels, predictions)
-    f1 = f1_score(labels, predictions, average="binary", zero_division=0)
-    prec = precision_score(labels, predictions, average="binary", zero_division=0)
-    rec = recall_score(labels, predictions, average="binary", zero_division=0)
+    f1_bin = f1_score(labels, predictions, average="binary", zero_division=0)
+    f1_mac = f1_score(labels, predictions, average="macro", zero_division=0)
+    prec_bin = precision_score(labels, predictions, average="binary", zero_division=0)
+    rec_bin = recall_score(labels, predictions, average="binary", zero_division=0)
+    pct_pred_1 = float(np.mean(predictions == 1))
 
     return {
         "accuracy": float(acc),
-        "f1": float(f1),
-        "precision": float(prec),
-        "recall": float(rec),
+        "f1": float(f1_bin),
+        "f1_macro": float(f1_mac),
+        "precision": float(prec_bin),
+        "recall": float(rec_bin),
+        "pred_positive_ratio": pct_pred_1,
     }
 
 
@@ -254,6 +269,8 @@ class WeightedTrainer(Trainer):
         """Initialize WeightedTrainer with optional precomputed class weights tensor."""
         super().__init__(*args, **kwargs)
         self.class_weights = class_weights
+        self._logged_compute_loss: bool = False
+        self._loss_call_count: int = 0
 
     def compute_loss(
         self,
@@ -263,21 +280,48 @@ class WeightedTrainer(Trainer):
         num_items_in_batch: Optional[Union[torch.Tensor, int]] = None,
         **kwargs: Any,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
-        """Compute class-weighted cross-entropy loss against ground-truth labels."""
+        """Compute class-weighted cross-entropy loss against ground-truth labels.
+
+        Compatible with transformers >= 5.x Trainer signature:
+        (self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs).
+        """
+        self._loss_call_count += 1
+
+        # Debug print: confirms compute_loss override is executed during training
+        if not self._logged_compute_loss:
+            print(
+                f"\n[WeightedTrainer.compute_loss] OVERRIDE VERIFIED ACTIVE during training!\n"
+                f"  Class weights tensor: {self.class_weights}\n"
+                f"  num_items_in_batch: {num_items_in_batch}\n"
+            )
+            self._logged_compute_loss = True
+        elif self._loss_call_count <= 5 or self._loss_call_count % 50 == 0:
+            print(
+                f"[WeightedTrainer.compute_loss] Step/Call #{self._loss_call_count}: "
+                f"compute_loss() executed | class_weights={self.class_weights.tolist() if self.class_weights is not None else None}"
+            )
+
         labels = inputs.get("labels")
         outputs = model(**inputs)
         logits = outputs.get("logits") if isinstance(outputs, dict) else outputs.logits
 
+        num_classes = logits.shape[-1]
         if labels is not None and self.class_weights is not None:
             # Move class weights tensor to the active model device and dtype
             weights = self.class_weights.to(device=logits.device, dtype=logits.dtype)
             loss_fct = nn.CrossEntropyLoss(weight=weights)
-            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+            loss = loss_fct(logits.view(-1, num_classes), labels.view(-1))
         elif labels is not None:
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+            loss = loss_fct(logits.view(-1, num_classes), labels.view(-1))
         else:
             loss = outputs.get("loss") if isinstance(outputs, dict) else outputs.loss
+
+        # Ensure model output object contains the weighted loss
+        if isinstance(outputs, dict):
+            outputs["loss"] = loss
+        elif hasattr(outputs, "loss"):
+            outputs.loss = loss
 
         return (loss, outputs) if return_outputs else loss
 
@@ -287,7 +331,7 @@ class WeightedTrainer(Trainer):
 # ---------------------------------------------------------------------------
 
 def setup_training(
-    df: pd.DataFrame,
+    df: Optional[pd.DataFrame] = None,
     model_name: str = DEFAULT_MODEL_ID,
     output_dir: Union[str, Path] = DEFAULT_OUTPUT_DIR,
     best_model_dir: Union[str, Path] = DEFAULT_CHECKPOINT_DIR,
@@ -300,11 +344,13 @@ def setup_training(
     seed: int = 42,
     max_length: int = 512,
     logging_steps: int = 10,
+    train_df: Optional[pd.DataFrame] = None,
+    **kwargs: Any,
 ) -> Tuple[WeightedTrainer, PreTrainedModel, PreTrainedTokenizerBase]:
     """Construct and configure the HuggingFace Trainer instance for verification fine-tuning.
 
     Args:
-        df: Input DataFrame with verification training examples.
+        df: Input DataFrame with verification training examples (or train_df).
         model_name: Pretrained model hub path.
         output_dir: Intermediate checkpoints directory.
         best_model_dir: Directory where top-performing model will be persisted.
@@ -317,10 +363,21 @@ def setup_training(
         seed: Random seed for deterministic shuffling and reproducibility.
         max_length: Maximum sequence truncation length.
         logging_steps: Frequency of training loss logging.
+        train_df: Optional alias for df.
 
     Returns:
         Tuple of (Trainer, Model, Tokenizer).
     """
+    # 0. Handle DataFrame input parameter and print length at the very start of setup_training()
+    if df is None and train_df is not None:
+        df = train_df
+    elif df is not None and train_df is None:
+        train_df = df
+
+    input_count = len(train_df) if train_df is not None else (len(df) if df is not None else 0)
+    print(f"\n[setup_training] len(train_df) at start of setup_training: {input_count} samples (before train/val split)")
+    logger.info("setup_training received %d samples in train_df before train/val split.", input_count)
+
     set_seed(seed)
     output_path = Path(output_dir).resolve()
     best_model_path = Path(best_model_dir).resolve()
@@ -330,16 +387,17 @@ def setup_training(
     # 1. Train / Validation Split (80 / 20)
     logger.info("Partitioning dataset into 80/20 train/validation split (val_split=%.2f, seed=%d)...", val_split, seed)
     stratify_col = df["label"] if df["label"].nunique() > 1 else None
-    train_df, val_df = train_test_split(
+    train_split_df, val_split_df = train_test_split(
         df,
         test_size=val_split,
         random_state=seed,
         stratify=stratify_col,
     )
-    logger.info("Split sizes: %d training samples, %d validation samples.", len(train_df), len(val_df))
+    logger.info("Split sizes: %d training samples, %d validation samples.", len(train_split_df), len(val_split_df))
+    print(f"[setup_training] Train/Val split: {len(train_split_df)} train samples, {len(val_split_df)} validation samples.")
 
     # 2. Compute Class Weights for Imbalance Mitigation
-    train_labels = np.array(train_df["label"].tolist())
+    train_labels = np.array(train_split_df["label"].tolist())
     unique_classes = np.unique(train_labels)
     if len(unique_classes) == 2:
         class_weights_arr = compute_class_weight(
@@ -366,8 +424,8 @@ def setup_training(
     model = model.to('cuda') if torch.cuda.is_available() else model
 
     # 4. Tokenize Datasets
-    train_dataset = prepare_data(train_df, tokenizer, max_length=max_length)
-    val_dataset = prepare_data(val_df, tokenizer, max_length=max_length)
+    train_dataset = prepare_data(train_split_df, tokenizer, max_length=max_length, dataset_name="Train")
+    val_dataset = prepare_data(val_split_df, tokenizer, max_length=max_length, dataset_name="Validation")
 
     # 5. Training Arguments
     # Dynamically select 'eval_strategy' (transformers >= 4.41) or 'evaluation_strategy' (< 4.41)
@@ -401,9 +459,14 @@ def setup_training(
         "save_strategy": "epoch",
         "logging_steps": logging_steps,
         "load_best_model_at_end": True,
-        "metric_for_best_model": "f1",
+        "metric_for_best_model": "f1_macro",
         "seed": seed,
     }
+
+    # Merge any extra valid TrainingArguments parameters from kwargs
+    for k, v in kwargs.items():
+        if k in valid_params:
+            training_kwargs[k] = v
 
     # Ensure no parameters force CPU usage
     for cpu_flag in ("no_cuda", "use_cpu"):
@@ -468,6 +531,47 @@ def train_verifier(
     eval_metrics = trainer.evaluate()
     logger.info("Final Validation Metrics: %s", eval_metrics)
 
+    # Validation Predictions & Logits Distribution Inspection
+    logger.info("Analyzing validation predictions and logits distribution...")
+    val_pred_output = trainer.predict(trainer.eval_dataset)
+    val_logits = val_pred_output.predictions
+    val_labels = val_pred_output.label_ids
+    val_preds = np.argmax(val_logits, axis=-1)
+
+    print("\n" + "=" * 80)
+    print("VALIDATION LOGITS & PREDICTIONS DISTRIBUTION ANALYSIS")
+    print("=" * 80)
+    print(f"Total Validation Samples Evaluated: {len(val_labels)}")
+    print(
+        f"Ground Truth Distribution : Class 0 (REFUTED): {np.sum(val_labels == 0):4d} ({np.mean(val_labels == 0):.2%}) | "
+        f"Class 1 (SUPPORTED): {np.sum(val_labels == 1):4d} ({np.mean(val_labels == 1):.2%})"
+    )
+    print(
+        f"Predicted Distribution    : Class 0 (REFUTED): {np.sum(val_preds == 0):4d} ({np.mean(val_preds == 0):.2%}) | "
+        f"Class 1 (SUPPORTED): {np.sum(val_preds == 1):4d} ({np.mean(val_preds == 1):.2%})"
+    )
+
+    if np.sum(val_preds == 0) == 0:
+        print("  >> [STATUS] MAJORITY-CLASS COLLAPSE: Model predicted ONLY Class 1 (SUPPORTED) for all validation samples.")
+    elif np.sum(val_preds == 1) == 0:
+        print("  >> [STATUS] MINORITY-CLASS COLLAPSE: Model predicted ONLY Class 0 (REFUTED) for all validation samples.")
+    else:
+        print(f"  >> [STATUS] BALANCED MIX PREDICTED: Model predicted {np.sum(val_preds == 0)} REFUTED and {np.sum(val_preds == 1)} SUPPORTED.")
+
+    print("\nSample Validation Batch Predictions (First 10 samples with raw logits):")
+    val_probs = torch.softmax(torch.tensor(val_logits[:10]), dim=-1).numpy()
+    for idx in range(min(10, len(val_labels))):
+        gt = val_labels[idx]
+        pred = val_preds[idx]
+        is_correct = "CORRECT" if pred == gt else "INCORRECT"
+        print(
+            f"  Sample {idx:02d} | True: {ID2LABEL.get(gt, str(gt)):<9} | "
+            f"Pred: {ID2LABEL.get(pred, str(pred)):<9} [{is_correct:<9}] | "
+            f"Logits: [0: {val_logits[idx][0]:+.4f}, 1: {val_logits[idx][1]:+.4f}] | "
+            f"P(0)={val_probs[idx][0]:.4f}, P(1)={val_probs[idx][1]:.4f}"
+        )
+    print("=" * 80 + "\n")
+
     best_path = Path(best_model_dir).resolve()
     logger.info("Saving best model and tokenizer to: %s", best_path)
     trainer.save_model(str(best_path))
@@ -477,6 +581,9 @@ def train_verifier(
         "train_result": train_result,
         "eval_metrics": eval_metrics,
         "best_model_dir": str(best_path),
+        "val_logits": val_logits,
+        "val_preds": val_preds,
+        "val_labels": val_labels,
     }
 
 
@@ -573,7 +680,39 @@ def run_sanity_check() -> bool:
     )
     metrics = compute_metrics(dummy_eval_pred)
     for k, v in metrics.items():
-        print(f"    {k:<10}: {v:.4f}")
+        print(f"    {k:<20}: {v:.4f}")
+
+    print("\n[6] Testing WeightedTrainer compute_loss() override execution...")
+    dummy_weights = torch.tensor([1.8182, 0.6897], dtype=torch.float32)
+    sanity_out = Path("./tmp_sanity_check").resolve()
+    sanity_out.mkdir(parents=True, exist_ok=True)
+    try:
+        training_args = TrainingArguments(
+            output_dir=str(sanity_out),
+            per_device_train_batch_size=len(dummy_df),
+            use_cpu=True,
+        )
+        weighted_trainer = WeightedTrainer(
+            model=model,
+            args=training_args,
+            class_weights=dummy_weights,
+        )
+        dummy_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+        dummy_loss, dummy_outputs = weighted_trainer.compute_loss(
+            model=model,
+            inputs=dummy_inputs,
+            return_outputs=True,
+        )
+        print(f"    Weighted Loss Value: {dummy_loss.item():.4f}")
+        assert dummy_loss is not None and not torch.isnan(dummy_loss), "Weighted loss is NaN"
+        print("    WeightedTrainer compute_loss() override successfully verified.")
+    finally:
+        import shutil
+        shutil.rmtree(str(sanity_out), ignore_errors=True)
 
     print("\n" + "=" * 80)
     print("SANITY CHECK PASSED: Architecture, Tokenization, and Forward Pass Validated!")
@@ -600,6 +739,12 @@ if __name__ == "__main__":
         help="Execute full training pipeline (recommended only with GPU)",
     )
     parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=2000,
+        help="Max samples to load from dataset for training (default: 2000)",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=8,
@@ -622,7 +767,7 @@ if __name__ == "__main__":
     if args.train:
         logger.info("Full training requested via CLI flag --train.")
         from src.data_loader import load_verification_dataset
-        df_train = load_verification_dataset("ragtruth", max_samples=100)
+        df_train = load_verification_dataset("ragtruth", max_samples=args.max_samples)
         train_verifier(
             df_train,
             batch_size=args.batch_size,
