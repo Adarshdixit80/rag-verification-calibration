@@ -45,6 +45,9 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
     Trainer,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
     TrainingArguments,
     set_seed,
 )
@@ -109,7 +112,10 @@ def load_verifier_model_and_tokenizer(
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         config=config,
+        torch_dtype=torch.float32,
     )
+    # Explicitly ensure full float32 precision across all parameters
+    model = model.float()
 
     if device is not None:
         model.to(device)
@@ -317,6 +323,23 @@ class WeightedTrainer(Trainer):
         else:
             loss = outputs.get("loss") if isinstance(outputs, dict) else outputs.loss
 
+        # Autograd graph verification print (Requirement 1)
+        if model.training:
+            if not getattr(self, "_logged_autograd_status", False):
+                print(
+                    f"\n[WeightedTrainer.compute_loss] AUTOGRAD GRAPH VERIFICATION:\n"
+                    f"  loss.requires_grad   : {loss.requires_grad} (Expected: True)\n"
+                    f"  loss.grad_fn         : {loss.grad_fn} (Expected: not None)\n"
+                    f"  logits.requires_grad : {logits.requires_grad if logits is not None else None} (Expected: True)\n"
+                )
+                self._logged_autograd_status = True
+            elif self._loss_call_count <= 5 or self._loss_call_count % 50 == 0:
+                print(
+                    f"[WeightedTrainer.compute_loss] Step {self._loss_call_count}: "
+                    f"loss.requires_grad={loss.requires_grad}, "
+                    f"loss.grad_fn={loss.grad_fn.__class__.__name__ if loss.grad_fn is not None else None}"
+                )
+
         # Ensure model output object contains the weighted loss
         if isinstance(outputs, dict):
             outputs["loss"] = loss
@@ -324,6 +347,91 @@ class WeightedTrainer(Trainer):
             outputs.loss = loss
 
         return (loss, outputs) if return_outputs else loss
+
+
+# ---------------------------------------------------------------------------
+# Gradient & Optimizer Diagnostic Callback
+# ---------------------------------------------------------------------------
+
+class GradientFlowDiagnosticCallback(TrainerCallback):
+    """Diagnostic callback to monitor optimizer parameters, gradient norms, and weight updates.
+
+    Verifies:
+    1. Gradient norm is non-zero after the first backward pass (Diagnostic 4).
+    2. Classification head weights actively change after training steps (Diagnostic 2).
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+        self.initial_weight: Optional[torch.Tensor] = None
+
+    def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any) -> None:
+        # Diagnostic 2 (Part A): Capture initial classifier weights
+        classifier_layer = getattr(self.model, "classifier", None)
+        if classifier_layer is not None and hasattr(classifier_layer, "weight"):
+            self.initial_weight = classifier_layer.weight.detach().clone()
+            norm = self.initial_weight.norm().item()
+            print("\n" + "=" * 75)
+            print("DIAGNOSTIC 2 (Part A): CAPTURING INITIAL CLASSIFIER WEIGHTS (BEFORE TRAINING)")
+            print("=" * 75)
+            print(f"model.classifier.weight shape : {list(self.initial_weight.shape)}")
+            print(f"Initial L2 Norm                : {norm:.8f}")
+            print(f"Sample initial weights (first 4 elements): {self.initial_weight[0, :4].tolist()}")
+            print("=" * 75 + "\n")
+
+    def on_pre_optimizer_step(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any) -> None:
+        # Diagnostic 4: Verify gradient norm right after backward pass before zero_grad()
+        if not hasattr(self, "_step1_grad_checked") or not self._step1_grad_checked:
+            print("\n" + "=" * 75)
+            print("DIAGNOSTIC 4: GRADIENT FLOW & NORM AFTER STEP 1 BACKWARD PASS (BEFORE zero_grad)")
+            print("=" * 75)
+            classifier_layer = getattr(self.model, "classifier", None)
+            if classifier_layer is not None and hasattr(classifier_layer, "weight"):
+                grad = classifier_layer.weight.grad
+                if grad is None:
+                    print(">> [ERROR] model.classifier.weight.grad is None! Gradients did NOT reach classifier.")
+                else:
+                    grad_l2 = grad.norm().item()
+                    is_zero = (grad_l2 == 0.0)
+                    print(f"model.classifier.weight.grad exists (NOT None).")
+                    print(f"Gradient Tensor Shape : {list(grad.shape)}")
+                    print(f"Gradient Tensor Dtype : {grad.dtype}")
+                    print(f"Gradient L2 Norm      : {grad_l2:.8f} (Is exactly zero: {is_zero})")
+                    print(f"Sample Gradient Values (first 4 elements): {grad[0, :4].tolist()}")
+                    if is_zero:
+                        print(">> [CRITICAL] Gradient norm is 0.0! Optimizer will NOT update weights.")
+                    else:
+                        print(f">> [CONFIRMED] Non-zero gradients ({grad_l2:.6f}) successfully flowed through backward pass!")
+            else:
+                print(">> [WARNING] Could not locate model.classifier.weight for gradient check.")
+            print("=" * 75 + "\n")
+            self._step1_grad_checked = True
+
+    def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any) -> None:
+        # Diagnostic 2 (Part B): Compare classifier weights after training
+        classifier_layer = getattr(self.model, "classifier", None)
+        if classifier_layer is not None and hasattr(classifier_layer, "weight") and self.initial_weight is not None:
+            final_weight = classifier_layer.weight.detach().clone()
+            init_norm = self.initial_weight.norm().item()
+            final_norm = final_weight.norm().item()
+            diff = (final_weight - self.initial_weight).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+
+            print("\n" + "=" * 75)
+            print(f"DIAGNOSTIC 2 (Part B): CLASSIFIER WEIGHT UPDATE COMPARISON (AFTER {state.global_step} STEPS)")
+            print("=" * 75)
+            print(f"Initial Classifier Weight L2 Norm : {init_norm:.8f}")
+            print(f"Final Classifier Weight L2 Norm   : {final_norm:.8f}")
+            print(f"Max Absolute Weight Change        : {max_diff:.10f}")
+            print(f"Mean Absolute Weight Change       : {mean_diff:.10f}")
+
+            if max_diff > 0.0:
+                print(f">> [CONFIRMED] model.classifier.weight CHANGED! Optimizer successfully updated parameters.")
+            else:
+                print(f">> [FAILURE] model.classifier.weight DID NOT CHANGE! Optimizer did not update parameters.")
+            print("=" * 75 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +607,28 @@ def setup_training(
         compute_metrics=compute_metrics,
         class_weights=class_weights_tensor,
     )
+
+    # 7. Diagnostic 3: Optimizer trainable parameters verification
+    trainer.create_optimizer()
+    opt_params_count = sum(len(group["params"]) for group in trainer.optimizer.param_groups)
+    model_trainable_params = sum(1 for p in model.parameters() if p.requires_grad)
+    total_model_params = sum(1 for p in model.parameters())
+
+    print("\n" + "=" * 75)
+    print("DIAGNOSTIC 3: OPTIMIZER TRAINABLE PARAMETERS VERIFICATION")
+    print("=" * 75)
+    print(f"Total model parameter tensors          : {total_model_params}")
+    print(f"Trainable model parameter tensors      : {model_trainable_params}")
+    print(f"Optimizer total parameter tensors      : {opt_params_count}")
+    print(f"Optimizer parameter groups count       : {len(trainer.optimizer.param_groups)}")
+    for idx, group in enumerate(trainer.optimizer.param_groups):
+        print(f"  Param Group {idx}: {len(group['params'])} parameter tensors | weight_decay={group.get('weight_decay')}")
+    all_match = (opt_params_count == model_trainable_params)
+    print(f"Verification: Optimizer contains ALL trainable parameters: {all_match}")
+    print("=" * 75 + "\n")
+
+    # Attach gradient and weight tracking diagnostic callback (Diagnostics 2 & 4)
+    trainer.add_callback(GradientFlowDiagnosticCallback(model=model))
 
     logger.info("WeightedTrainer successfully configured and initialized with class weights.")
     print(f"Model is on device: {next(model.parameters()).device}")
@@ -762,17 +892,28 @@ if __name__ == "__main__":
         default=1e-5,
         help="Learning rate (default: 1e-5)",
     )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=-1,
+        help="Maximum training steps (-1 for full epoch training)",
+    )
     args, unknown = parser.parse_known_args()
 
     if args.train:
         logger.info("Full training requested via CLI flag --train.")
         from src.data_loader import load_verification_dataset
         df_train = load_verification_dataset("ragtruth", max_samples=args.max_samples)
+        train_kwargs = {
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "learning_rate": args.lr,
+        }
+        if args.max_steps > 0:
+            train_kwargs["max_steps"] = args.max_steps
         train_verifier(
             df_train,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            learning_rate=args.lr,
+            **train_kwargs,
         )
     else:
         # Default behavior: Validate architecture and single forward pass
