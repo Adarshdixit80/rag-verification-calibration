@@ -503,7 +503,7 @@ def make_irrelevant(
     distractor_idx = 0
     for i, s in enumerate(sentences):
         if i in indices_to_replace:
-            result_sentences.append(distractor_pool[distractor_idx])
+            result_sentences.append(distractor_pool[distractor_idx % len(distractor_pool)])
             distractor_idx += 1
         else:
             result_sentences.append(s)
